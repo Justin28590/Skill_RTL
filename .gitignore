@@ -1,0 +1,51 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# Local tools, credentials and experiment output
+/.tools/
+.env
+.env.*
+!.env.example
+!.env.sample
+/configs/*.local.json
+/results/
+*.log
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# HDL / Scala build artifacts (keep pinned verification inputs)
+*.vvp
+*.vcd
+*.fst
+*.class
+target/
+.bsp/
+.metals/
+
+# Upstream snapshots are restored from sources.lock.json with --download.
+# Keep the task catalog, specs, licenses and test fixtures.
+/data/project-rtl/sources/
+
+# Optional validation output stays local; no files in this directory are tracked.
+# Rebuild on demand; opt in to hash checks with RTL_VALIDATE_EVIDENCE=1.
+/artifacts/
+
+# Local assignment reference, not a runtime dependency
+/机器学习大作业选题.pdf
