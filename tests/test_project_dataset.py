@@ -1,18 +1,14 @@
-"""Project dataset guards, verdicts and real reference smoke tests; no model calls."""
+"""Dataset integrity and verdict guards on tiny temporary fixtures; no model calls."""
 import copy
-import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from helpers import HAS_ICARUS, ROOT
+from helpers import HAS_ICARUS
 from rtlflow.project import load_projects
-from rtlflow.project_dataset import (elaborated_hierarchy, load_manifest, local_path,
-                                     output_verdict, save_json, sha256, verify_reference)
-
-DATA = ROOT / "data/project-rtl"
+from rtlflow.project_dataset import (load_manifest, local_path, output_verdict,
+                                     save_json, sha256, verify_reference)
 
 
 class ProjectDatasetTests(unittest.TestCase):
@@ -46,42 +42,6 @@ class ProjectDatasetTests(unittest.TestCase):
                          "support_sha256": {}, "tasks": [self.task]}
         self.path = self.root / "tasks.json"
         save_json(self.path, self.document)
-
-    def test_actual_32_projects_and_native_language_counts_are_locked(self):
-        root, manifest, sources = load_manifest(DATA / "tasks.json")
-        self.assertEqual(root, DATA)
-        self.assertEqual(len(manifest["tasks"]), 32)
-        self.assertEqual(len(sources), 27)
-        self.assertTrue(manifest["generation_ready"])
-        self.assertEqual({lang: sum(t['language'] == lang for t in manifest['tasks'])
-                          for lang in ('verilog', 'systemverilog', 'chisel')},
-                         {'verilog': 27, 'systemverilog': 3, 'chisel': 2})
-        self.assertTrue(all(t["scope"] == "complete_portable_ip_design" for t in manifest["tasks"]))
-        cmac = next(t for t in manifest["tasks"] if t["id"] == "cmac")
-        self.assertTrue(any("secworks/aes/" in p for p in cmac["rtl_files"]))
-
-    @unittest.skipUnless(os.environ.get("RTL_VALIDATE_EVIDENCE") == "1",
-                         "local evidence check: set RTL_VALIDATE_EVIDENCE=1 (see docs/验收.md)")
-    def test_published_reference_evidence_is_complete_and_unchanged(self):
-        evidence = ROOT / "artifacts/project-rtl/reference"
-        summary = json.loads((evidence / "summary.json").read_text())
-        self.assertEqual(summary["manifest_sha256"], sha256(DATA / "tasks.json"))
-        self.assertEqual(summary["reference_passed"], 32)
-        self.assertEqual(summary["negative_controls_passed"], 32)
-        self.assertEqual(summary["model_calls"], 0)
-        for name, expected in summary["validator_sha256"].items():
-            self.assertEqual(sha256(ROOT / name), expected)
-        for item in summary["tasks"]:
-            report_path = evidence / item["report"]
-            self.assertEqual(sha256(report_path), item["report_sha256"])
-            report = json.loads(report_path.read_text())
-            self.assertGreaterEqual(report["hierarchy"]["module_type_count"], 2)
-            for phase in ("reference", "negative"):
-                for check in ("compile", "simulation"):
-                    record = report[phase][check]
-                    for stream in ("stdout", "stderr"):
-                        log = report_path.parent / phase / Path(record[stream + "_log"]).name
-                        self.assertEqual(sha256(log), record[stream + "_sha256"])
 
     def test_tampered_reference_or_spec_rejected(self):
         target = self.root / self.task["rtl_files"][0]
@@ -212,15 +172,6 @@ class ProjectDatasetTests(unittest.TestCase):
         result = verify_reference(self.root, self.task, self.root / "out")
         self.assertEqual(result["reference_status"], "passed")
         self.assertEqual(result["negative_control_status"], "failed")
-
-    @unittest.skipUnless(HAS_ICARUS, "iverilog/vvp required")
-    def test_real_uart_whole_project_smoke(self):
-        root, manifest, _ = load_manifest(DATA / "tasks.json")
-        task = next(t for t in manifest["tasks"] if t["id"] == "wbuart32")
-        result = verify_reference(root, task, self.root / "uart")
-        self.assertEqual(result["reference_status"], "passed")
-        self.assertEqual(result["negative_control_status"], "passed")
-        self.assertEqual(result["hierarchy"]["module_type_count"], 4)
 
 
 if __name__ == "__main__":

@@ -1,24 +1,14 @@
-# 数据集
+# 数据
 
-当前只有一套数据：[Project RTL：32 个开源硬件 IP](project-rtl/README.md)。
-
-```text
-project-rtl/
-  tasks.json          # 唯一任务入口：来源、参考验证、模型生成配置
-  specs/              # 每个项目一份有效需求说明，提供给模型
-  sources/            # 锁定版本的上游源码、文档和许可证
-  tests/              # 黑盒测试、固件和候选测试适配
-  sources.lock.json   # 上游提交与文件哈希；仅用于来源锁定
-```
-
-**看需求 → `specs/<ID>.md`；选任务 → `tasks.json`；生成和检查验证结果 → [验收说明](../docs/验收.md)。**
-
-32 个独立项目的原生语言 Verilog/SystemVerilog/Chisel 为 27/3/2；生成目标可选 27/30/2，不按翻译重复计数。当前仍为 pilot，未冻结 dev/test，也没有真实模型能力成绩。
+模型主流程唯一输入：[`requirements.json`](requirements.json)，包含全部32个案例的高层需求和目标语言，不携带旧端口、参数、固定周期或TB路径。
 
 ```bash
-python3 scripts/project_dataset.py --check-data
-python3 scripts/project_dataset.py --stats
 python3 run.py --check-data
+python3 run.py --task aes systolic_matmul --check-data
 ```
 
-这些检查不调用模型、不执行 HDL/Scala、不联网。首次检出需按[快速检查](../README.md)恢复锁定的上游源码。许可见 [LICENSES.md](project-rtl/LICENSES.md)。
+这些检查不调用模型、不执行HDL/Scala、不联网，也不需要下载参考源码。目标语言组合为Verilog/SystemVerilog/Chisel的27/30/2项，翻译不重复计为独立案例。数据仍为pilot，未冻结dev/test。
+
+全部案例使用同一个[设计、冻结与独立验证流程](../docs/设计流程.md)。模型自行设计接口、参数、时序；外部标准和算法仍是需求约束。复杂设计的生成与验证可能失败或阻塞，清单覆盖不等于功能验证成绩。
+
+[`project-rtl/`](project-rtl/README.md)保留开源来源、许可证、锁定源码及历史参考验证资料。其`tasks.json`、`specs/`和固定TB仅用于来源审计与底层工具回归；`run.py`不再加载它们，也没有旧流程开关。维护这些历史材料时才需要下载上游快照及运行对应脚本，见[运行与验证](../docs/运行与验证.md)。

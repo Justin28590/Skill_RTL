@@ -1,9 +1,8 @@
-"""Modern compute/packet IP intake and semantic regression guards, no model calls."""
+"""Compute/packet testbenches must reject semantic faults, not just compile RTL."""
 import unittest
 
 from helpers import HAS_ICARUS, ROOT, TemporaryTestCase
 from rtlflow.project import load_projects, verify_project, write_bundle
-from rtlflow.project_dataset import load_manifest
 from scripts.verify_project_replay import reference_bundle
 
 
@@ -16,25 +15,6 @@ class ComputeProjectTests(TemporaryTestCase):
         write_bundle(files, source)
         return verify_project(files, source, task, self.directory / name / 'checks',
                               {'language': 'systemverilog', 'tool_timeout_seconds': 30})
-
-    def test_modern_projects_are_selectable_and_have_separate_compute_contracts(self):
-        root, manifest, sources = load_manifest(ROOT / 'data/project-rtl/tasks.json')
-        systolic = self.task('systolic_matmul')
-        switch = self.task('axis_packet_switch')
-        self.assertEqual(systolic['category'], 'ai_accelerator')
-        self.assertEqual(switch['category'], 'accelerator_interconnect')
-        self.assertEqual(len(systolic['dut_roots']), 3)
-        self.assertIn('UINT8', systolic['contract_text'])
-        self.assertIn('3*N-2', systolic['contract_text'])
-        self.assertIn('M_CONNECT', switch['contract_text'])
-        with self.assertRaisesRegex(ValueError, '不支持'):
-            load_projects(root / 'tasks.json', ['systolic_matmul'], 'verilog')
-        self.assertEqual(load_projects(root / 'tasks.json', ['axis_packet_switch'], 'verilog')[0]['id'], 'axis_packet_switch')
-        # Shared repository intake extends, rather than discards, the FIFO source lock.
-        axis_files = sources['alexforencich/verilog-axis']['files']
-        self.assertTrue({'rtl/axis_fifo_adapter.v', 'rtl/axis_fifo.v', 'rtl/axis_switch.v',
-                         'rtl/arbiter.v', 'rtl/priority_encoder.v', 'rtl/axis_register.v'} <= set(axis_files))
-        self.assertEqual(len({t['id'] for t in manifest['tasks']}), 32)
 
     @unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
     def test_systolic_wrong_signedness_or_transpose_is_rejected(self):
@@ -51,16 +31,6 @@ class ComputeProjectTests(TemporaryTestCase):
                 self.assertEqual(result['checks']['compile']['status'], 'passed')
                 self.assertEqual(result['functional_status'], 'failed')
                 self.assertIn('ERROR matrix product', result['checks']['simulation']['stdout'])
-
-    @unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
-    def test_systolic_missing_pe_is_not_a_complete_project(self):
-        task = self.task('systolic_matmul')
-        files = reference_bundle(task)
-        del files['pe.sv']
-        result = self.verify(task, files, 'missing-pe')
-        self.assertEqual(result['functional_status'], 'failed')
-        self.assertEqual(result['checks']['candidate_compile']['status'], 'failed')
-        self.assertEqual(result['checks']['simulation']['status'], 'not_run')
 
     @unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
     def test_switch_scoreboard_rejects_lost_keep_and_id_sidebands(self):

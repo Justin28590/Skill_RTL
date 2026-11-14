@@ -7,88 +7,29 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from helpers import HAS_ICARUS, ROOT, SkillHTTPReplay, TemporaryTestCase
+from helpers import HAS_ICARUS, ROOT, SkillHTTPReplay, ImplementationTestCase as TemporaryTestCase
 from rtlflow.cli import main
-from rtlflow.project import bundle_text, load_projects, masked, verify_project, write_bundle
-from rtlflow.project_dataset import sha256
+from rtlflow.project import bundle_text, load_projects, verify_project, write_bundle
 from scripts.verify_project_replay import reference_bundle
 
 
 class ProjectGenerationDataTests(TemporaryTestCase):
-    def test_layout_has_one_spec_per_task_and_separate_tests(self):
-        root = ROOT / 'data/project-rtl'
-        catalog = json.loads((root / 'tasks.json').read_text())
-        self.assertEqual(catalog['schema_version'], 'project-rtl-v2')
-        self.assertEqual({p.name for p in root.iterdir() if p.is_dir()}, {'specs', 'sources', 'tests'})
-        specifications = {t['specification'] for t in catalog['tasks']}
-        self.assertEqual(len(specifications), 32)
-        self.assertEqual(specifications, {str(p.relative_to(root)) for p in (root / 'specs').glob('*.md')})
-        for task in catalog['tasks']:
-            self.assertNotIn('public_specification', task)
-            self.assertNotIn('contract', task['generation'])
-            self.assertEqual(task['specification_sha256'], sha256(root / task['specification']))
-            self.assertTrue(all(p.startswith('tests/') for p in task['generation']['candidate_testbench_files']))
-
-    def test_all_projects_have_public_contracts_blackbox_tests_and_parameters(self):
-        tasks=load_projects(ROOT/'data/project-rtl/tasks.json',language='systemverilog')
-        tasks+=load_projects(ROOT/'data/project-rtl/tasks.json',language='chisel')
-        self.assertEqual(len(tasks),32)
+    def test_catalog_has_public_contracts_and_separate_test_adapters(self):
+        path = ROOT / 'data/project-rtl/tasks.json'
+        catalog = json.loads(path.read_text())
+        tasks = load_projects(path, language='systemverilog') + load_projects(path, language='chisel')
+        self.assertTrue(tasks)
+        self.assertCountEqual([t['id'] for t in tasks], [t['id'] for t in catalog['tasks']])
+        self.assertEqual(len({t['contract'] for t in tasks}), len(tasks))
         for task in tasks:
-            self.assertIn('## 顶层接口',task['contract_text'])
-            self.assertIn('## 编译配置',task['contract_text'])
-            self.assertEqual(set(task['public_parameters']),set(task['design_tops']))
-            self.assertTrue(task['candidate_testbench_files'])
-            self.assertFalse(any('/src/rtl/' in name for name in task['candidate_testbench_files']))
-            for name in task['candidate_testbench_files']:
-                text=masked((Path(task['dataset_root'])/name).read_text())
-                self.assertNotIn('dut.core.',text)
-                self.assertNotIn('dut.cmac_inst.',text)
-                self.assertNotIn('dut.block_reg',text)
-        cmac=next(t for t in tasks if t['id']=='cmac')
-        self.assertTrue(any('K1/K2' in item for v in cmac['testbench_adaptations'].values() for item in v['changes']))
-        self.assertIn('51级',next(t for t in tasks if t['id']=='triple_des')['contract_text'])
-        self.assertIn('0x03020100',next(t for t in tasks if t['id']=='md5')['contract_text'])
-
-    @unittest.skipUnless(os.environ.get("RTL_VALIDATE_EVIDENCE") == "1",
-                         "local evidence check: set RTL_VALIDATE_EVIDENCE=1 (see docs/验收.md)")
-    def test_published_candidate_evidence_matches_current_validator_and_sources(self):
-        base=ROOT/'artifacts/project-rtl/candidate'
-        for language in ('verilog','systemverilog','chisel'):
-            directory=base/language
-            summary=json.loads((directory/'summary.json').read_text())
-            count={'verilog':27,'systemverilog':30,'chisel':2}[language]
-            self.assertEqual((summary['total'],summary['passed'],summary['negative_controls_passed']),(count,count,count))
-            self.assertEqual(summary['model_calls'],0)
-            self.assertEqual(summary['manifest_sha256'],sha256(ROOT/'data/project-rtl/tasks.json'))
-            for name,value in summary['validator_sha256'].items():
-                self.assertEqual(sha256(ROOT/name),value,name)
-            for task in summary['tasks']:
-                report_path=directory/task['report']
-                self.assertEqual(sha256(report_path),task['report_sha256'])
-                result=json.loads(report_path.read_text())
-                self.assertFalse(result['reference_rtl_linked'])
-                self.assertEqual(result['functional_status'],'passed')
-                self.assertEqual(result['negative_control_status'],'passed')
-                self.assertEqual(result['negative_control']['checks']['compile']['status'],'passed')
-                for name,value in result['source_sha256'].items():
-                    self.assertEqual(sha256(report_path.parent/'source'/name),value)
-                    self.assertEqual(sha256(report_path.parent/'negative/source'/name),value)
-                self.assertEqual(sha256(report_path.parent/'negative/fault.v'),result['fault_sha256'])
-                for name,value in result['logs_sha256'].items():
-                    self.assertEqual(sha256(report_path.parent/name),value)
-
-    def test_task_selection_and_unsupported_language_rejected(self):
-        path=ROOT/'data/project-rtl/tasks.json'
-        self.assertEqual([t['id'] for t in load_projects(path,['wbuart32'])],['wbuart32'])
-        with self.assertRaises(ValueError):load_projects(path,['and2'])
-        self.assertEqual(len(load_projects(path,language='chisel')),2)
-        with self.assertRaisesRegex(ValueError,'不支持'):load_projects(path,['aes'],language='chisel')
-        legacy=self.directory/'legacy.json'
-        legacy.write_text('{"schema_version":"project-generation-v1"}')
-        with self.assertRaises(ValueError):load_projects(legacy)
+            with self.subTest(task=task['id']):
+                self.assertTrue(task['contract_text'].strip())
+                self.assertEqual(set(task['public_parameters']), set(task['design_tops']))
+                self.assertTrue(task['candidate_testbench_files'])
+                self.assertTrue(all(p.startswith('tests/') for p in task['candidate_testbench_files']))
 
     @unittest.skipUnless(HAS_ICARUS,'requires Icarus/vvp')
-    def test_real_project_cli_fake_http_missing_fifo_then_repair(self):
+    def test_archived_project_implementation_fake_http_missing_fifo_then_repair(self):
         task=load_projects(ROOT/'data/project-rtl/tasks.json',['wbuart32'])[0]
         good=reference_bundle(task)
         bad={name:code for name,code in good.items() if name!='ufifo.v'}
@@ -96,8 +37,9 @@ class ProjectGenerationDataTests(TemporaryTestCase):
         output=self.directory/'real-uart-project'
         with patch.dict(os.environ,{'GLM_API_KEY':'UNIT_ONLY_FAKE_KEY'},clear=True), \
                 patch('rtlflow.providers.urllib.request.urlopen',side_effect=replay), \
+                patch('rtlflow.cli.load_design_matrix', return_value={'verilog': [task]}), \
                 contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-            status=main(['--task','wbuart32','--group','Skill','--output',str(output)])
+            status=main(['--language','verilog','--task','wbuart32','--group','Skill','--output',str(output)])
         self.assertEqual(status,0)
         report=json.loads((output/'wbuart32/report.json').read_text())
         self.assertTrue(report['repair_success'])

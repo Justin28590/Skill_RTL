@@ -9,6 +9,11 @@ SKILL_ROOT = Path(__file__).resolve().parents[2] / "skills/rtl-readable"
 MAX_DOCUMENT_BYTES = 64 * 1024
 DEFAULT_AGENT_TURNS = 6
 MAX_AGENT_TURNS = 12
+SKILL_RELOAD_REQUEST = (
+    "本轮是新的独立Skill会话，上一版响应不代表本轮已读取文档。"
+    "请先调用read_skill读取SKILL.md，再读取rules.md和本阶段语言参考；"
+    "必须完成本轮三份读取后再处理以下反馈并交付结果，不要直接输出修订正文。\n"
+)
 
 
 def agent_turn_limit(settings):
@@ -18,16 +23,35 @@ def agent_turn_limit(settings):
     return value
 
 
-def skill_capabilities(language):
-    """Runtime capabilities, not a task-specific request to invoke a named Skill."""
+def skill_capabilities(language, phase="implementation"):
+    """Adapt the same portable Skill to each isolated workflow role."""
     language_of({"language": language})
+    roles = {
+        "design": "当前调用执行需求分析、设计契约或契约修订；运用Skill的设计与自检步骤，"
+                  "只交付上面规定的完整设计JSON，不写RTL或TB。设计确认由外层独立审查完成，不等待用户确认。",
+        "design_review": "当前调用独立审查需求与设计契约；运用Skill的契约检查规则，"
+                         "仅交付上面规定的审查JSON，不改写提案、不写RTL或TB，有问题必须拒绝。",
+        "verification_design": "当前调用根据需求与冻结契约设计或修订独立SystemVerilog TB；"
+                               "运用Skill的独立期望值、边界、复位、握手和采样检查，"
+                               "仅交付上面的body/coverage/oracle_description JSON，不生成候选RTL，不改变冻结契约。",
+        "verification_review": "当前调用独立审查SystemVerilog验证环境；运用Skill的验证检查规则，"
+                               "只交付上面规定的审查JSON，检查oracle、覆盖、采样与时序，有问题必须拒绝，"
+                               "不得修改契约、放宽判据或生成候选RTL。",
+        "implementation": "当前调用仅执行已冻结契约的RTL实现/修复/重构，不重新设计或等待用户确认，"
+                          "不新建TB；最终严格按上面的完整JSON源码协议交付。",
+    }
+    if phase not in roles:
+        raise ValueError("未知Skill调用阶段")
     return (
-        "\n\n可用工具：read_skill，可按用户请求只读加载已注册的 Skill。"
-        "Skill 入口为 SKILL.md；使用 Skill 时需按其要求读取 rules.md 和"
-        f" references/{language}.md，完成读取后再返回最终源码。"
-        "工具只读这些公开 Skill 文档；规则工具只返回通用规则和当前语言分支。"
-        "独立验证、评分、修复预算与回退由外层控制器执行；不要自行执行命令、"
-        "读取其他文件或声称已经验证。Skill 中面向人工操作的仓库命令/链接不是工具权限。"
+        "\n\n" + roles[phase]
+        + "可用工具：read_skill，可按用户请求只读加载已注册的 Skill。"
+        "入口为 SKILL.md；本次调用必须先读取入口，再读取 rules.md 和"
+        f" references/{language}.md，三份读取完成后才提交本阶段结果。"
+        "每次调用独立加载；工具只读这三份文档，规则仅返回通用部分和当前语言分支。"
+        "只使用本轮显式提供的输入，不继承其他阶段的对话、工具读取记录或私有推理。"
+        "阶段推进、冻结、工具验证、评分、修复预算与回退由外层控制器执行，不自行开始额外修复轮次；"
+        "不得读取工程/测试或其他文件、执行命令、联网、写文件或声称已验证。"
+        "通用Skill中的工程操作建议不扩大当前权限，交付格式以本阶段协议为准。"
     )
 
 

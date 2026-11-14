@@ -2,10 +2,13 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,9 +17,10 @@ from .skill_tools import SkillReader, agent_turn_limit
 
 
 class GenerationError(RuntimeError):
-    def __init__(self, message, metadata=None):
+    def __init__(self, message, metadata=None, *, code="generation_error"):
         super().__init__(message)
         self.metadata = metadata or {}
+        self.code = code
 
 
 @dataclass
@@ -69,6 +73,93 @@ class MockProvider:
             raise GenerationError(f"无法读取离线响应：{path.name}") from exc
 
 
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+def read_completion(response, *, model, started, timeout, on_chunk):
+    """Assemble public SSE deltas only. Never retain reasoning_content or raw events.
+
+    JSON responses remain supported for non-streaming endpoints. A stream must
+    finish explicitly; EOF/timeout must never turn a partial project into a candidate.
+    """
+    maximum = MAX_RESPONSE_BYTES
+    headers = getattr(response, "headers", {})
+    if "text/event-stream" not in headers.get("Content-Type", "").lower():
+        raw = response.read(maximum + 1)
+        if len(raw) > maximum:
+            raise GenerationError("模型响应超过大小上限", code="response_too_large")
+        return json.loads(raw)
+    content, calls, usage = [], {}, {}
+    stop = None
+    seen_model = None
+    size = 0
+    event = []
+    # Bound wire input, including ignored reasoning and heartbeat events.
+    while True:
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError()
+        line = response.readline(maximum - size + 1)
+        size += len(line)
+        if size > maximum:
+            raise GenerationError("模型流式响应超过大小上限", code="response_too_large")
+        if not line:
+            raise GenerationError("模型流式响应中断：未收到 [DONE]；不接受部分源码", code="stream_incomplete")
+        line = line.decode("utf-8").rstrip("\r\n")
+        if line:
+            if line.startswith("data:"):
+                event.append(line[5:].lstrip(" "))
+            continue
+        if not event:  # SSE comments/heartbeats are not model output.
+            continue
+        data = "\n".join(event)
+        event = []
+        if data == "[DONE]":
+            if stop is None or seen_model is None:
+                raise GenerationError("模型流式响应缺少结束原因或模型标识", code="stream_incomplete")
+            message = {"content": "".join(content)}
+            if calls:
+                message["tool_calls"] = [calls[index] for index in sorted(calls)]
+            return {"model": seen_model, "choices": [{"message": message, "finish_reason": stop}], "usage": usage}
+        payload = json.loads(data)
+        if not isinstance(payload, dict) or "error" in payload:
+            raise GenerationError("模型流式响应格式无效或返回错误", code="invalid_response")
+        response_model = payload.get("model")
+        if response_model is not None:
+            if response_model != model:
+                raise GenerationError("GLM 返回的模型与请求不一致；不接受自动换模", code="model_mismatch")
+            seen_model = response_model
+        if payload.get("usage"):
+            usage = payload["usage"]
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) > 1:
+            raise ValueError("invalid_stream_choices")
+        for choice in choices:
+            if choice.get("index", 0) != 0 or stop is not None:
+                raise ValueError("invalid_stream_choice")
+            delta = choice.get("delta", {})
+            text = delta.get("content")
+            if text is not None:
+                if not isinstance(text, str):
+                    raise ValueError("invalid_content_delta")
+                content.append(text)
+            for fragment in delta.get("tool_calls") or []:
+                index = fragment["index"]
+                if type(index) is not int or not 0 <= index < 4:
+                    raise ValueError("invalid_tool_index")
+                call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                if fragment.get("type", "function") != "function":
+                    raise ValueError("invalid_tool_type")
+                if "id" in fragment:
+                    call["id"] += fragment["id"]
+                function = fragment.get("function", {})
+                for key in ("name", "arguments"):
+                    if key in function:
+                        call["function"][key] += function[key]
+            if choice.get("finish_reason") is not None:
+                stop = choice["finish_reason"]
+        on_chunk(usage)
+
+
 class GLMProvider:
     """Bounded GLM Skill tool loop; no automatic retries or reasoning-text export."""
 
@@ -92,20 +183,35 @@ class GLMProvider:
         if not self.api_key:
             raise ValueError(f"请设置 API 密钥环境变量 {key_env}；不会自动降级为 mock")
         self.url = base + "/chat/completions"
-        self.timeout = settings.get("api_timeout_seconds", 120)
+        self.timeout = settings.get("api_timeout_seconds", 600)
+        self.stream = settings.get("api_stream", True)
+        if type(self.stream) is not bool:
+            raise ValueError("api_stream 必须为布尔值")
         self.temperature = settings.get("temperature", 1.0)
-        self.max_tokens = settings.get("max_tokens", 8192)
+        self.max_tokens = settings.get("max_tokens")
+        if self.max_tokens is not None and (type(self.max_tokens) is not int or self.max_tokens <= 0):
+            raise ValueError("max_tokens 必须为正整数或 null；省略/null 表示使用服务端默认值")
         self.max_agent_turns = agent_turn_limit(settings)
 
     def request_body(self, messages, skill=None):
         body = {
             "model": self.model, "messages": messages,
-            "temperature": self.temperature, "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
             "thinking": {"type": "enabled"}, "reasoning_effort": self.thinking,
         }
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
+        if self.stream:
+            body.update(stream=True, stream_options={"include_usage": True})
         if skill is not None:
-            body["tools"] = [skill.definition()]
-            body["tool_choice"] = "auto"
+            definition = skill.definition()
+            if not skill.complete:
+                definition["function"]["parameters"]["properties"]["path"]["enum"] = [
+                    path for path in skill.available_paths if path not in skill.documents]
+            body["tools"] = [definition]
+            # Each stage must load its own documents before answering. Once loaded,
+            # disable further reads instead of spending the budget re-reading them.
+            body["tool_choice"] = "none" if skill.complete else "required"
         return body
 
     @staticmethod
@@ -148,6 +254,10 @@ class GLMProvider:
             "agent_mode": "skill_tools" if skill is not None else "direct",
             "max_agent_turns": limit, "tool_calls": 0,
             "skill_loaded": False, "skill_documents": {}, "usage": usage,
+            "usage_complete": False, "usage_observed_calls": 0,
+            "api_stream": self.stream, "api_timeout_seconds": self.timeout,
+            "max_tokens_requested": self.max_tokens,
+            "token_limit_mode": "server_default" if self.max_tokens is None else "explicit",
         }
         trace = {"schema_version": 1, "task_id": task_id, "status": "running", "turns": []}
         if trace_dir is not None:
@@ -167,10 +277,51 @@ class GLMProvider:
                 temporary.replace(path)
 
         used_ids = set()
+        turn = None
         try:
-            for _ in range(limit):
+            for index in range(limit):
+                # A failed request must not inherit the previous tool turn's finish reason.
+                metadata.pop("stop_reason", None)
+                metadata.pop("response_model", None)
+                metadata["usage_complete"] = False
                 body = self.request_body(conversation, skill)
-                turn = {"request": deepcopy(body)}
+                turn = {"request": deepcopy(body), "status": "running", "stream_chunks": 0,
+                        "usage": {}, "usage_complete": False}
+                request_started = time.monotonic()
+                last_checkpoint = last_progress = request_started
+
+                def record_usage(raw_usage):
+                    # Streaming usage is cumulative within a request, not additive
+                    # per chunk. Preserve observed counters even if [DONE] is lost.
+                    if raw_usage is None:
+                        return
+                    if not isinstance(raw_usage, dict):
+                        raise ValueError("invalid_usage")
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        value = raw_usage.get(key)
+                        if type(value) is int and value >= 0:
+                            usage[key] = usage.get(key, 0) + value - turn["usage"].get(key, 0)
+                            turn["usage"][key] = value
+                    if len(turn["usage"]) == 3 and not turn["usage_complete"]:
+                        turn["usage_complete"] = True
+                        metadata["usage_observed_calls"] += 1
+                    metadata["usage_complete"] = metadata["usage_observed_calls"] == metadata["model_calls"]
+
+                def on_chunk(raw_usage):
+                    nonlocal last_checkpoint, last_progress
+                    record_usage(raw_usage)
+                    now = time.monotonic()
+                    turn["stream_chunks"] += 1
+                    turn.setdefault("first_chunk_seconds", round(now - request_started, 4))
+                    turn["elapsed_seconds"] = round(now - request_started, 4)
+                    if now - last_checkpoint >= 1 or turn["stream_chunks"] == 1:
+                        checkpoint()
+                        last_checkpoint = now
+                    if now - last_progress >= 30:
+                        print(f"[{task_id}] 已接收 {turn['stream_chunks']} 段，"
+                              f"等待完整响应（{now - request_started:.0f}s）", file=sys.stderr, flush=True)
+                        last_progress = now
+
                 trace["turns"].append(turn)
                 checkpoint()
                 request = urllib.request.Request(
@@ -180,32 +331,36 @@ class GLMProvider:
                 )
                 metadata["model_calls"] += 1
                 checkpoint()
+                print(f"[{task_id}] {metadata['agent_mode']} HTTP {index + 1}/{limit} "
+                      f"等待模型（超时 {self.timeout}s）", file=sys.stderr, flush=True)
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    payload = json.load(response)
+                    payload = read_completion(response, model=self.model, started=request_started,
+                                              timeout=self.timeout, on_chunk=on_chunk)
+                turn["elapsed_seconds"] = round(time.monotonic() - request_started, 4)
                 choice = payload["choices"][0]
                 response_model = payload.get("model")
                 stop = choice.get("finish_reason")
                 # Do not persist arbitrary endpoint strings in protocol metadata.
                 metadata.update(response_model=self.model if response_model == self.model else "<mismatch>",
                                 stop_reason=stop if stop in ("stop", "length", "tool_calls") else "<invalid>")
-                # Whitelist usage counters; arbitrary endpoint fields are not exported.
-                turn_usage = {}
-                raw_usage = payload.get("usage") or {}
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    value = raw_usage.get(key)
-                    if type(value) is int and value >= 0:
-                        turn_usage[key] = value
-                        usage[key] = usage.get(key, 0) + value
-                turn["usage"] = turn_usage
+                record_usage(payload.get("usage"))
+                turn["stop_reason"] = metadata["stop_reason"]
                 if metadata["response_model"] != self.model:
-                    raise GenerationError("GLM 返回的模型与请求不一致；不接受自动换模", metadata)
+                    raise GenerationError("GLM 返回的模型与请求不一致；不接受自动换模", code="model_mismatch")
                 stop = metadata["stop_reason"]
-                if stop == "length":
-                    raise GenerationError("模型输出被截断；请检查 max_tokens", metadata)
                 message = choice["message"]
                 text = message.get("content")
-                if stop == "tool_calls" and skill is not None:
-                    calls = self.tool_calls(message, skill.available_paths, used_ids)
+                if isinstance(text, str):
+                    turn["response"] = {"role": "assistant", "content": text}
+                if stop == "length":
+                    limit = ("未显式设置 max_tokens，使用服务端默认值" if self.max_tokens is None
+                             else f"请求 max_tokens={self.max_tokens}")
+                    raise GenerationError(
+                        f"模型输出被截断（{limit}）；请核对端点默认值、模型输出/上下文上限及推理预算。"
+                        "省略 max_tokens 不代表无限输出；不接受部分源码。", code="output_truncated")
+                if stop == "tool_calls" and skill is not None and not skill.complete:
+                    allowed = body["tools"][0]["function"]["parameters"]["properties"]["path"]["enum"]
+                    calls = self.tool_calls(message, allowed, used_ids)
                     assistant = {"role": "assistant", "content": text if isinstance(text, str) else None,
                                  "tool_calls": calls}
                     turn["response"] = assistant
@@ -221,32 +376,50 @@ class GLMProvider:
                         turn["tool_results"].append(result)
                         conversation.append(result)
                         checkpoint()
+                    turn["status"] = "passed"
                     continue
                 if stop != "stop" or message.get("tool_calls"):
-                    raise GenerationError("GLM 未正常完成文本输出", metadata)
+                    raise GenerationError("GLM 未正常完成文本输出", code="invalid_response")
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("empty_content")
                 turn["response"] = {"role": "assistant", "content": text}
                 if skill is not None and not skill.complete:
-                    raise GenerationError("模型未完成 Skill 必读文档加载；不接受未使用 Skill 的候选", metadata)
+                    raise GenerationError("模型未完成 Skill 必读文档加载；不接受本阶段结果", code="skill_not_loaded")
+                turn["status"] = "passed"
                 trace["status"] = "passed"
                 checkpoint()
                 return Generation(text, usage, metadata)
-            raise GenerationError("Skill 工具循环达到 max_agent_turns 上限", metadata)
+            raise GenerationError("Skill 工具循环达到 max_agent_turns 上限", code="agent_turn_limit")
         except KeyboardInterrupt:
             trace.update(status="interrupted", error="KeyboardInterrupt")
             raise
         except GenerationError as exc:
-            trace.update(status="failed", error=str(exc))
+            metadata["error_code"] = exc.code
+            exc.metadata = metadata
+            trace.update(status="failed", error=str(exc), error_code=exc.code)
             raise
         except urllib.error.HTTPError as exc:
             # Do not log bodies, headers or credentials returned by an endpoint.
             error = f"模型 API HTTP {exc.code}"
-            trace.update(status="failed", error=error)
-            raise GenerationError(error, metadata) from exc
-        except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-            error = f"模型请求、Skill 工具或响应格式无效：{type(exc).__name__}"
-            trace.update(status="failed", error=error)
-            raise GenerationError(error, metadata) from exc
+            metadata.update(error_code="http_error", http_status=exc.code)
+            trace.update(status="failed", error=error, error_code="http_error")
+            raise GenerationError(error, metadata, code="http_error") from exc
+        except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            timed_out = isinstance(exc, TimeoutError) or (
+                isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError))
+            code = ("api_timeout" if timed_out else "transport_error"
+                    if isinstance(exc, (OSError, http.client.HTTPException)) else "invalid_response")
+            error = (f"模型 API 超时（api_timeout_seconds={self.timeout}）；未收到完整响应，用量可能未知。"
+                     "请检查网络/服务状态或调整请求超时；未自动重试。" if timed_out else
+                     f"模型请求、Skill 工具或响应格式无效：{type(exc).__name__}")
+            metadata["error_code"] = code
+            trace.update(status="failed", error=error, error_code=code)
+            raise GenerationError(error, metadata, code=code) from exc
         finally:
+            if turn is not None:
+                turn["elapsed_seconds"] = round(time.monotonic() - request_started, 4)
+                if turn["status"] == "running":
+                    turn["status"] = trace["status"]
+                    if "error_code" in trace:
+                        turn["error_code"] = trace["error_code"]
             checkpoint()

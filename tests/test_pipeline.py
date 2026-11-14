@@ -4,12 +4,17 @@ import unittest
 from unittest.mock import patch
 
 from helpers import HAS_ICARUS, RULES, TASKS, SequenceProvider, TemporaryTestCase, fixture
-from rtlflow.pipeline import run_task
+from rtlflow.pipeline import _run_implementation as run_task
 from rtlflow.project import bundle_text, parse_bundle
 from rtlflow.providers import GenerationError
 
 
-class PipelineChecks:
+# Shared controller behavior is tested once. Two-arm parity and actual Skill
+# loading are covered by test_comparison.py and test_skill_agent.py.
+@unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
+class PipelineTests(TemporaryTestCase):
+    group = 'Baseline'
+
     def sequence(self, responses, task='and2', **settings):
         provider = SequenceProvider(responses)
         report = run_task(TASKS[task], provider, {'group':self.group,'max_repairs':2,'max_refactors':1,
@@ -90,6 +95,36 @@ class PipelineChecks:
         self.assertEqual(report['stop_reason'],'generation_error')
         self.assertTrue(Path(report['final_bundle']).is_file())
 
+    def test_malformed_last_repair_retains_last_complete_snapshot(self):
+        for task in ('and2', 'add8'):
+            broken = fixture(task + '.broken.v')
+            provider = SequenceProvider([broken, 'not JSON'])
+            report = run_task(TASKS[task], provider, {'max_repairs': 1, 'max_refactors': 0},
+                              RULES, self.directory/task)
+            self.assertEqual(report['functional_status'], 'failed')
+            self.assertEqual(report['stop_reason'], 'repair_limit')
+            self.assertEqual(report['selected_attempt'], 0)
+            self.assertEqual(Path(report['final_bundle']).read_text(), broken)
+            self.assertEqual(report['generation_failures'], 1)
+            self.assertEqual(report['last_error_code'], 'invalid_project_bundle')
+            self.assertFalse(report['attempts'][1]['selected_final'])
+
+    def test_malformed_repair_can_still_be_repaired_with_remaining_budget(self):
+        report, provider = self.sequence([fixture('and2.broken.v'), 'not JSON', fixture('and2.v')],
+                                         max_refactors=0)
+        self.assertEqual(report['functional_status'], 'passed')
+        self.assertEqual(report['selected_attempt'], 2)
+        self.assertEqual(report['repair_calls'], 2)
+        self.assertEqual(provider.messages[2][-2]['content'], 'not JSON')
+
+    def test_unavailable_refactor_score_rolls_back_instead_of_crashing(self):
+        with patch('rtlflow.pipeline.score_readability', side_effect=[
+                {'score': 40, 'status': 'passed'}, {'score': None, 'status': 'not_run'}]):
+            report, _ = self.sequence([fixture('and2.v'), fixture('and2.v')])
+        self.assertEqual(report['functional_status'], 'passed')
+        self.assertEqual(report['stop_reason'], 'refactor_rejected_rolled_back')
+        self.assertEqual(report['selected_attempt'], 0)
+
     def test_systemverilog_multifile_project(self):
         files={p.replace('.v','.sv'):c.replace('wire','logic') for p,c in parse_bundle(fixture('and2.v')).items()}
         report,_=self.sequence([bundle_text(files)],language='systemverilog')
@@ -97,17 +132,9 @@ class PipelineChecks:
         self.assertEqual(set(report['files_sha256']),{'child.sv','top.sv'})
 
 
-@unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
-class BaselinePipelineTests(PipelineChecks, TemporaryTestCase):
+class UnavailableTests(TemporaryTestCase):
     group = 'Baseline'
 
-
-@unittest.skipUnless(HAS_ICARUS, 'requires Icarus/vvp')
-class SkillPipelineTests(PipelineChecks, TemporaryTestCase):
-    group = 'Skill'
-
-
-class UnavailableChecks:
     def test_missing_tools_do_not_trigger_model_repairs(self):
         provider=SequenceProvider([fixture('and2.v')])
         with patch('rtlflow.project.shutil.which',return_value=None):
@@ -135,11 +162,3 @@ class UnavailableChecks:
             report=run_task(TASKS['and2'],provider,{'group':self.group},RULES,self.directory)
         self.assertEqual(report['refactor_calls'],0)
         self.assertEqual(report['stop_reason'],'readability_unavailable_refactor_skipped')
-
-
-class BaselineUnavailableTests(UnavailableChecks, TemporaryTestCase):
-    group = 'Baseline'
-
-
-class SkillUnavailableTests(UnavailableChecks, TemporaryTestCase):
-    group = 'Skill'

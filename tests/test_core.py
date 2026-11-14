@@ -1,12 +1,11 @@
 import contextlib
 import io
 import json
-from pathlib import Path
 import re
 from unittest.mock import patch
 
 from helpers import ROOT, RULES, TASKS, TemporaryTestCase, fixture
-from rtlflow.cli import load_settings, load_tasks, main
+from rtlflow.cli import load_settings, main
 from rtlflow.pipeline import initial_messages
 from rtlflow.project import bundle_text, parse_bundle
 from rtlflow.providers import GenerationError
@@ -50,28 +49,17 @@ class CoreTests(TemporaryTestCase):
                 self.assertIn('完整 JSON', system)
                 self.assertIn('所有文件', system)
 
-    def test_shipped_config_and_default_verilog_projects(self):
-        settings = load_settings(ROOT/'configs/glm.json')
-        tasks = load_tasks(settings['tasks'])
-        self.assertEqual(len(tasks), 27)
-        self.assertEqual(settings['max_tokens'], 32768)
-        self.assertTrue(all(t['project'] for t in tasks))
-        self.assertNotIn('and2', [t['id'] for t in tasks])
-        self.assertIn('picorv32_axi', [t['id'] for t in tasks])
-        for path in (ROOT/'configs').glob('*.json'):
-            self.assertTrue(Path(load_settings(path)['tasks']).is_file())
-
     def test_bad_config_fields_and_limits(self):
         path = self.directory/'config.json'
         for extra in ({'max_repairs':-1}, {'max_refactors':11}, {'api_key':'secret'},
                       {'tool_timeout_seconds':0}, {'temperature':float('nan')},
-                      {'max_repairs':True}, {'max_tokens':0},
+                      {'max_repairs':True}, {'max_tokens':0}, {'provider':'unknown'},
                       *({'group': group} for group in 'ABCD')):
             path.write_text(json.dumps({'provider':'glm','tasks':'tasks.json',**extra}))
             with self.assertRaises(ValueError):load_settings(path)
 
     def test_first_party_document_links_exist(self):
-        documents = [ROOT/'README.md', ROOT/'data/README.md', ROOT/'data/project-rtl/README.md',
+        documents = [ROOT/'README.md', ROOT/'tests/README.md', ROOT/'data/README.md', ROOT/'data/project-rtl/README.md',
                      *sorted((ROOT/'docs').glob('*.md'))]
         for document in documents:
             for target in re.findall(r'\[[^\]]+\]\(([^)]+)\)', document.read_text()):
@@ -80,21 +68,7 @@ class CoreTests(TemporaryTestCase):
                 with self.subTest(document=document.name, target=target):
                     self.assertTrue((document.parent / target.split('#', 1)[0]).exists())
 
-    def test_removed_data_and_history_paths_absent(self):
-        for name in ('data/demo','data/rtlbench','data/sources/rtlbench','configs/demo.json',
-                     'configs/rtlbench-verilog-dev.json','scripts/import_rtlbench.py','examples/chisel',
-                     'data/project-rtl/public','data/project-rtl/contracts','data/project-rtl/evaluation',
-                     'data/project-rtl/verification','data/project-rtl/validation','data/project-rtl/generation-validation',
-                     'data/project-rtl/manifest.json','data/project-rtl/generation.json'):
-            self.assertFalse((ROOT/name).exists(), name)
-        # New runs may create results/ again. No assertion forbids new user results.
-
-    def test_cli_check_data_is_offline_and_unknown_ids_fail_before_provider(self):
-        with patch('rtlflow.cli.create_provider') as provider, contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(main(['--check-data','--task','aes','--group','Baseline']), 0)
-            self.assertEqual(json.loads(out.getvalue())['total'], 1)
-            self.assertEqual(json.loads(out.getvalue())['model_calls'], 0)
-        provider.assert_not_called()
+    def test_invalid_cli_inputs_fail_before_provider(self):
         for args in (['--task','and2'], ['--language','chisel','--task','aes'], ['--config','missing.json']):
             with patch('rtlflow.cli.create_provider') as provider, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(main(args), 2)

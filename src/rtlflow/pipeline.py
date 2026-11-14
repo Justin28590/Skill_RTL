@@ -1,22 +1,35 @@
 """Project generation, bounded repair, whole-project rollback and artifact reporting."""
+from collections import Counter
 import csv
 import hashlib
 import json
 from pathlib import Path
+import sys
 import time
 
 from . import __version__
-from .languages import LABELS, language_of, select_rules
+from .languages import LABELS, LANGUAGES, language_of, select_rules
 from .project import bundle_text, parse_bundle, verify_project, write_bundle
 from .project_dataset import save_json
 from .providers import GenerationError
 from .score import score_readability
-from .skill_tools import SkillReader, skill_capabilities
+from .skill_tools import SKILL_RELOAD_REQUEST, SkillReader, skill_capabilities
 from .verify import tool_versions
 
 
 GROUPS = ("Baseline", "Skill")
 DEFAULT_GROUP = "Baseline"
+REPORT_SCHEMA = 6
+WORKFLOW_PHASES = ("design", "design_review", "verification_design", "verification_review",
+                   "initial", "repair", "refactor")
+
+
+def sum_usage(items):
+    """Sum only observed counters; missing API usage is not zero-cost evidence."""
+    usage = Counter()
+    for item in items:
+        usage.update(item.get("usage", {}))
+    return dict(usage)
 
 
 def digest(text):
@@ -32,7 +45,7 @@ def initial_messages(task, group, rules, language="verilog"):
         from .chisel import validate_chisel_config
         validate_chisel_config(task.get("chisel_tops"), task["design_tops"])
     system = (
-        f"你是 {LABELS[language]} 项目级 RTL 工程师。根据公开设计契约实现整个硬件项目。"
+        f"你是 {LABELS[language]} 项目级 RTL 工程师。根据已审查冻结的设计契约实现整个硬件项目。"
         "必须包含所有公开顶层及完整子模块依赖；每个顶层都应有实际展开的子模块，不得用桩或常量替代功能。"
         "保留外部端口和参数，允许改变内部模块名和架构。最终只返回一个完整 JSON 对象："
         '{"files":[{"path":"rtl/top.v","content":"完整文件内容"},{"path":"rtl/child.v","content":"完整文件内容"}]}。'
@@ -61,6 +74,7 @@ def initial_messages(task, group, rules, language="verilog"):
         system += "目标为Icarus -g2012支持的可综合SystemVerilog；源文件用.sv，头文件用.svh（也允许兼容.v/.vh）。"
     else:
         system += "源文件用.v，头文件用.vh；使用项目指定的Verilog方言，默认2005，wbuart32/PicoRV32兼容2012。"
+    system += "契约中的位宽表达式//表示整数除法；生成HDL时使用/，不能把它复制为行注释。冻结后不得更改端口、参数、时序或功能来迎合验证。"
     if group == "Skill":
         system += skill_capabilities(language)
     user = (("请调用 rtl-readable Skill，" if group == "Skill" else "")
@@ -97,14 +111,15 @@ def repair_feedback(attempt):
     return '\n'.join(parts)
 
 
-def run_task(task, provider, settings, rules, output):
+def _run_implementation(task, provider, settings, rules, output, *, task_directory=None):
     language = language_of(settings)
     # Reject unsupported frontends before directory creation or a paid provider call.
     group = settings.get("group", DEFAULT_GROUP)
     base_messages = initial_messages(task, group, rules, language)
     started = time.monotonic()
-    task_dir = Path(output).resolve() / task["id"]
-    task_dir.mkdir(parents=True, exist_ok=False)
+    task_dir = Path(task_directory) if task_directory else Path(output).resolve() / task["id"]
+    if task_directory is None:
+        task_dir.mkdir(parents=True, exist_ok=False)
     # Both arms share the same feedback, budgets, verification and rollback path.
     max_repairs = settings.get("max_repairs", 2)
     max_refactors = settings.get("max_refactors", 1)
@@ -117,12 +132,16 @@ def run_task(task, provider, settings, rules, output):
         messages = list(base_messages)
         if previous is not None:
             previous_text = Path(previous.get("bundle_path", previous["response_path"])).read_text()
+            if group == "Skill":
+                feedback = SKILL_RELOAD_REQUEST + feedback
             messages += [{"role": "assistant", "content": previous_text}, {"role": "user", "content": feedback}]
         save_json(attempt_dir / "prompt.json", messages)
         attempt = {"index": len(attempts), "phase": phase, "language": language,
+                   "skill_requested": group == "Skill", "skill_language": language if group == "Skill" else None,
                    "prompt_path": str(attempt_dir / "prompt.json"), "selected_final": False,
                    "repairable": False, "generation_status": "failed"}
         attempts.append(attempt)
+        print(f"[{language}/{group}/{task['id']}] attempt {attempt['index']:02d} {phase}：生成", file=sys.stderr, flush=True)
         call_start = time.monotonic()
         try:
             response = provider.generate(task["id"], messages, skill=SkillReader(language) if group == "Skill" else None,
@@ -130,6 +149,8 @@ def run_task(task, provider, settings, rules, output):
             attempt.update(usage=response.usage, generation_metadata=response.metadata)
         except GenerationError as exc:
             attempt["error"] = str(exc)
+            attempt["error_code"] = exc.code
+            print(f"[{language}/{group}/{task['id']}] {exc.code}：{exc}", file=sys.stderr, flush=True)
             attempt["generation_metadata"] = exc.metadata
             attempt["usage"] = exc.metadata.get("usage", {})
             return attempt
@@ -144,6 +165,8 @@ def run_task(task, provider, settings, rules, output):
             files = parse_bundle(response.text, language)
         except GenerationError as exc:
             attempt["format_error"] = str(exc)
+            attempt["error_code"] = "invalid_project_bundle"
+            print(f"[{language}/{group}/{task['id']}] 交付格式无效：{exc}", file=sys.stderr, flush=True)
             attempt["verification"] = {"functional_status": "failed", "checks": {
                 "bundle": {"status": "failed", "reason": "invalid_project_bundle"}}}
             return attempt
@@ -155,6 +178,7 @@ def run_task(task, provider, settings, rules, output):
         attempt.update(generation_status="passed", bundle_path=str(bundle_path), source_directory=str(source),
                        source_path=str(bundle_path), source_sha256=digest(bundle), files_sha256=hashes,
                        rtl_path=str(source), rtl_sha256=digest(bundle))
+        print(f"[{language}/{group}/{task['id']}] attempt {attempt['index']:02d}：验证", file=sys.stderr, flush=True)
         attempt["verification"] = verify_project(files, source, task, attempt_dir / "checks", settings)
         if language == "chisel":
             emitted = attempt["verification"].get("emitted_directory")
@@ -164,6 +188,8 @@ def run_task(task, provider, settings, rules, output):
         # Score candidate source in deterministic path order, never JSON or emitted RTL.
         attempt["readability"] = score_readability('\n'.join(files.values()), language)
         attempt["readability"]["project_file_order"] = list(files)
+        print(f"[{language}/{group}/{task['id']}] 功能={attempt['verification']['functional_status']} "
+              f"可读性={attempt['readability']['score']}", file=sys.stderr, flush=True)
         return attempt
 
     def status(attempt):
@@ -192,14 +218,19 @@ def run_task(task, provider, settings, rules, output):
             feedback = ("功能通过。仅改善可读性，保持所有顶层接口和逐周期行为；返回完整项目 JSON files。\n"
                         + json.dumps(current["readability"], ensure_ascii=False))
             candidate = generate_and_check("refactor", current, feedback)
-            accepted = (status(candidate) == "passed" and candidate.get("readability", {}).get("score", -1)
-                        > current["readability"]["score"])
+            candidate_score = candidate.get("readability", {}).get("score")
+            accepted = (status(candidate) == "passed" and candidate_score is not None
+                        and candidate_score > current["readability"]["score"])
             candidate["refactor_accepted"] = accepted
             if not accepted:
                 stop_reason = "refactor_rejected_rolled_back"
                 break
             current = candidate
             stop_reason = "refactor_accepted"
+    # A malformed repair is feedback for the next attempt, not a replacement
+    # snapshot. If the budget ends there, retain the last complete project.
+    if not current.get("bundle_path"):
+        current = next((a for a in reversed(attempts) if a.get("bundle_path")), current)
     final_source = final_rtl = None
     if current.get("bundle_path"):
         current["selected_final"] = True
@@ -218,8 +249,9 @@ def run_task(task, provider, settings, rules, output):
     final_status = status(current)
     initial_status = status(attempts[0])
     score = current.get("readability", {}).get("score")
+    errors = [a for a in attempts if a.get("error_code")]
     report = {
-        "schema_version": 4, "pipeline_version": __version__, "artifact_kind": "multi_file_project",
+        "schema_version": REPORT_SCHEMA, "pipeline_version": __version__, "artifact_kind": "multi_file_project",
         "task_id": task["id"], "group": group, "language": language,
         "provider": provider.name, "model": provider.model, "api_endpoint": getattr(provider, "url", None),
         "demo_only": provider.name == "mock", "pilot_only": True,
@@ -240,6 +272,13 @@ def run_task(task, provider, settings, rules, output):
         "source_sha256": current.get("source_sha256"), "rtl_sha256": current.get("rtl_sha256"),
         "files_sha256": current.get("files_sha256", {}), "selected_attempt": current["index"] if final_source else None,
         "provider_calls": len(attempts),
+        "generation_failures": len(errors),
+        "generation_error_counts": dict(Counter(a["error_code"] for a in errors)),
+        "last_error_code": errors[-1]["error_code"] if errors else None,
+        "last_error": errors[-1].get("error", errors[-1].get("format_error")) if errors else None,
+        "usage": sum_usage(attempts),
+        "usage_complete": all(a.get("generation_metadata", {}).get("usage_complete", provider.name == "mock")
+                              for a in attempts),
         "tool_calls": sum(a.get("generation_metadata", {}).get("tool_calls", 0) for a in attempts),
         "model_calls": sum(a.get("generation_metadata", {}).get("model_calls", 0 if provider.name == "mock" else 1) for a in attempts),
         "model_call_count_estimated": any(a.get("generation_metadata", {}).get("call_count_estimated", False) for a in attempts),
@@ -250,6 +289,104 @@ def run_task(task, provider, settings, rules, output):
         "elapsed_seconds": round(time.monotonic() - started, 4), "attempts": attempts,
     }
     save_json(task_dir / "report.json", report)
+    return report
+
+
+def workflow_skill_report(calls, group, implementation_attempts, selected_index):
+    """Report actual reads across reached phases, not a claim of pipeline completion."""
+    requested = group == "Skill"
+    loaded = [call for call in calls if call.get("generation_metadata", {}).get("skill_loaded", False)]
+    selected = next((call for call in implementation_attempts if call["index"] == selected_index), None)
+    selected_loaded = bool(selected and selected.get("generation_metadata", {}).get("skill_loaded", False))
+    # Do not merge hashes across stages (the TB and DUT may use different guides).
+    # Preserve selected RTL evidence on rollback; otherwise show the latest read.
+    partial = [call for call in calls if call.get("generation_metadata", {}).get("skill_documents")]
+    evidence = selected if selected_loaded else (loaded or partial or calls or [{}])[-1]
+    metadata = evidence.get("generation_metadata", {})
+    documents = metadata.get("skill_documents", {})
+    by_phase = {}
+    for phase in WORKFLOW_PHASES:
+        stage = [call for call in calls if call["phase"] == phase]
+        count = sum(call.get("generation_metadata", {}).get("skill_loaded", False) for call in stage)
+        partial_reads = any(call.get("generation_metadata", {}).get("skill_documents") for call in stage)
+        status = ("not_requested" if not requested else "not_run" if not stage else
+                  "loaded" if count == len(stage) else "partial" if count or partial_reads else "not_loaded")
+        by_phase[phase] = {"calls": len(stage), "loaded_calls": count, "status": status}
+    return {
+        "skill_scope": "full_workflow" if requested else "none",
+        "skill_loaded": bool(loaded), "skill_required_calls": len(calls) if requested else 0,
+        "skill_loaded_calls": len(loaded),
+        "skill_all_calls_loaded": requested and bool(calls) and len(loaded) == len(calls),
+        "implementation_skill_loaded": selected_loaded, "skill_by_phase": by_phase,
+        "skill_mode": metadata.get("agent_mode", "offline_replay"),
+        "skill_version": "tool-v1" if loaded else None, "skill_documents": documents,
+        "skill_evidence_phase": evidence.get("phase") if documents else None,
+        "skill_evidence_prompt_path": evidence.get("prompt_path") if documents else None,
+        "rules_applied": "rules.md" in documents, "rules_sha256": documents.get("rules.md", {}).get("sha256"),
+    }
+
+
+def run_task(task, provider, settings, rules, output):
+    """The only public workflow: requirements, reviewed freeze, independent TB, RTL."""
+    from .design import SCHEMA, identifier, run_design, text
+    from .design_verify import prepare_verification
+    language = language_of(settings)
+    group = settings.get("group", DEFAULT_GROUP)
+    if group not in GROUPS:
+        raise ValueError("group 必须为 Baseline/Skill")
+    if task.get("workflow") != SCHEMA:
+        raise ValueError("需要高层需求任务；旧固定契约生成入口已移除")
+    identifier(task["id"])
+    text(task.get("requirements_text"), "高层需求")
+    if language not in task["target_languages"]:
+        raise ValueError("任务不支持目标语言")
+    started = time.monotonic()
+    directory = Path(output).resolve() / task["id"]
+    directory.mkdir(parents=True, exist_ok=False)
+    prepared, design = run_design(task, provider, settings, directory)
+    verification = {"status": "not_run", "attempts": []}
+    if prepared is not None:
+        prepared, verification = prepare_verification(prepared, provider, settings, directory)
+    if prepared is not None:
+        report = _run_implementation(prepared, provider, settings, rules, output, task_directory=directory)
+    else:
+        report = {
+            "schema_version": REPORT_SCHEMA, "pipeline_version": __version__, "artifact_kind": "multi_file_project",
+            "task_id": task["id"], "group": group, "language": language,
+            "provider": provider.name, "model": provider.model, "api_endpoint": getattr(provider, "url", None),
+            "demo_only": provider.name == "mock", "pilot_only": True,
+            "dataset_provenance": task["dataset_provenance"], "dataset": task["dataset_provenance"]["dataset"], "split": "pilot",
+            "skill_requested": group == "Skill", "skill_loaded": False, "skill_mode": "not_run",
+            "skill_documents": {}, "skill_version": None, "rules_applied": False,
+            "functional_status": "not_run", "initial_functional_status": "not_run",
+            "readability_score": None, "readability_status": "not_run", "readability_method": None,
+            "readability_threshold_met": False, "final_source": None, "final_rtl": None, "final_bundle": None,
+            "selected_attempt": None, "provider_calls": 0, "model_calls": 0, "tool_calls": 0,
+            "model_call_count_estimated": False, "usage": {}, "usage_complete": True,
+            "generation_failures": 0, "generation_error_counts": {}, "last_error_code": None, "last_error": None,
+            "repair_calls": 0, "refactor_calls": 0, "repair_success": False,
+            "effective_max_repairs": settings.get("max_repairs", 2),
+            "effective_max_refactors": settings.get("max_refactors", 1), "attempts": [],
+            "stop_reason": "design_not_frozen" if design["status"] != "frozen" else "verification_not_frozen",
+        }
+    preparation = design["attempts"] + verification["attempts"]
+    all_calls = preparation + report["attempts"]
+    errors = [a for a in all_calls if a.get("error_code")]
+    report.update(workflow_skill_report(all_calls, group, report["attempts"], report["selected_attempt"]))
+    report.update(schema_version=REPORT_SCHEMA, workflow=SCHEMA, design=design, verification_preparation=verification,
+                  contract_sha256=design.get("contract_sha256"), verification_sha256=verification.get("verification_sha256"),
+                  public_requirements=task["requirements_text"],
+                  design_calls=len(design["attempts"]), verification_calls=len(verification["attempts"]),
+                  provider_calls=len(all_calls), usage=sum_usage(all_calls),
+                  usage_complete=all(a.get("generation_metadata", {}).get("usage_complete", provider.name == "mock") for a in all_calls),
+                  model_calls=sum(a.get("generation_metadata", {}).get("model_calls", 0 if provider.name == "mock" else 1) for a in all_calls),
+                  tool_calls=sum(a.get("generation_metadata", {}).get("tool_calls", 0) for a in all_calls),
+                  model_call_count_estimated=any(a.get("generation_metadata", {}).get("call_count_estimated", False) for a in all_calls),
+                  generation_failures=len(errors), generation_error_counts=dict(Counter(a["error_code"] for a in errors)),
+                  last_error_code=errors[-1]["error_code"] if errors else None,
+                  last_error=errors[-1].get("error", errors[-1].get("format_error")) if errors else None,
+                  elapsed_seconds=round(time.monotonic() - started, 4))
+    save_json(directory / "report.json", report)
     return report
 
 
@@ -266,9 +403,12 @@ def run_batch(tasks, provider, settings, rules, output):
 def write_summary(reports, settings, output, extra=None):
     fields = ["task_id", "language", "dataset", "split", "group", "provider", "model", "demo_only", "functional_status",
               "initial_functional_status", "skill_requested", "skill_loaded", "rules_applied",
+              "skill_scope", "skill_required_calls", "skill_loaded_calls", "skill_all_calls_loaded", "implementation_skill_loaded",
               "readability_score", "readability_status", "readability_method", "provider_calls", "model_calls", "tool_calls",
+              "workflow", "design_calls", "verification_calls", "contract_sha256", "verification_sha256",
               "repair_calls", "refactor_calls", "effective_max_repairs", "effective_max_refactors",
-              "repair_success", "elapsed_seconds", "stop_reason"]
+              "repair_success", "elapsed_seconds", "stop_reason", "generation_failures", "last_error_code",
+              "last_error", "usage_complete"]
     with (output / "summary.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader(); writer.writerows(reports)
@@ -277,8 +417,18 @@ def write_summary(reports, settings, output, extra=None):
         "passed": sum(r["functional_status"] == "passed" for r in reports),
         "failed": sum(r["functional_status"] == "failed" for r in reports),
         "not_run": sum(r["functional_status"] == "not_run" for r in reports),
+        "generation_failures": sum(r["generation_failures"] for r in reports),
+        "generation_error_counts": dict(sum((Counter(r["generation_error_counts"]) for r in reports), Counter())),
+        "usage": sum_usage(reports), "usage_complete": all(r["usage_complete"] for r in reports),
         "provider_calls": sum(r["provider_calls"] for r in reports), "model_calls": sum(r["model_calls"] for r in reports),
         "tool_calls": sum(r["tool_calls"] for r in reports), "skill_loaded_runs": sum(r["skill_loaded"] for r in reports),
+        "skill_required_calls": sum(r.get("skill_required_calls", 0) for r in reports),
+        "skill_loaded_calls": sum(r.get("skill_loaded_calls", 0) for r in reports),
+        "skill_all_calls_loaded_runs": sum(r.get("skill_all_calls_loaded", False) for r in reports),
+        "design_calls": sum(r.get("design_calls", 0) for r in reports),
+        "verification_calls": sum(r.get("verification_calls", 0) for r in reports),
+        "design_frozen": sum(r.get("design", {}).get("status") == "frozen" for r in reports),
+        "verification_frozen": sum(r.get("verification_preparation", {}).get("status") == "frozen" for r in reports),
         "model_call_count_estimated": any(r["model_call_count_estimated"] for r in reports),
         "repairs_succeeded": sum(r["repair_success"] for r in reports),
         "demo_only": any(r["demo_only"] for r in reports), "pilot_only": True, "output": str(output),
@@ -306,18 +456,57 @@ def run_group_comparison(tasks, provider_factory, settings, rules, groups, outpu
     reports, group_summaries = [], {}
     by_task = {task["id"]: {} for task in tasks}
     fields = ("functional_status", "initial_functional_status", "skill_requested", "skill_loaded", "skill_mode",
+              "skill_scope", "skill_required_calls", "skill_loaded_calls", "skill_all_calls_loaded",
+              "implementation_skill_loaded", "skill_by_phase",
               "rules_applied", "readability_score", "readability_status", "readability_method",
               "provider_calls", "model_calls", "tool_calls", "repair_calls",
               "refactor_calls", "effective_max_repairs", "effective_max_refactors", "elapsed_seconds",
-              "stop_reason", "final_source", "final_rtl", "final_bundle")
+              "stop_reason", "generation_failures", "last_error_code", "last_error", "usage", "usage_complete",
+              "final_source", "final_rtl", "final_bundle", "workflow", "design_calls", "verification_calls",
+              "contract_sha256", "verification_sha256")
     for group in groups:
         selected = {**settings, "group": group}
         group_summaries[group] = run_batch(tasks, provider_factory(selected), selected, rules, output / group)
         for task in tasks:
             path = output / group / task["id"] / "report.json"
             report = json.loads(path.read_text()); reports.append(report)
-            by_task[task["id"]][group] = {**{key: report[key] for key in fields}, "report_path": str(path)}
+            by_task[task["id"]][group] = {**{key: report.get(key) for key in fields}, "report_path": str(path)}
     order = {task["id"]: index for index, task in enumerate(tasks)}
     reports.sort(key=lambda r: (order[r["task_id"]], groups.index(r["group"])))
     return write_summary(reports, settings, output, {"mode": "group_comparison", "task_count": len(tasks),
                         "groups": groups, "by_group": group_summaries, "by_task": by_task})
+
+
+def run_language_matrix(task_matrix, provider_factory, settings, rules, groups, output):
+    """Keep language runs isolated and aggregate counts, never cross-language scores."""
+    groups = list(groups)
+    if not groups or len(set(groups)) != len(groups) or any(g not in GROUPS for g in groups):
+        raise ValueError("groups 必须为非空且不重复的 Baseline/Skill 组列表")
+    if not task_matrix or any(lang not in LANGUAGES or not tasks for lang, tasks in task_matrix.items()):
+        raise ValueError("语言矩阵必须包含受支持的语言及非空任务列表")
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    config = {k: v for k, v in settings.items() if k not in {"language", "group"}}
+    save_json(output / "config.json", {
+        **config, "languages": list(task_matrix), "groups": groups,
+        "task_ids": {lang: [t["id"] for t in tasks] for lang, tasks in task_matrix.items()},
+    })
+    reports, by_language = [], {}
+    for language, tasks in task_matrix.items():
+        selected = {**settings, "language": language}
+        directory = output / language
+        if len(groups) > 1:
+            by_language[language] = run_group_comparison(tasks, provider_factory, selected, rules, groups, directory)
+        else:
+            selected["group"] = groups[0]
+            by_language[language] = run_batch(tasks, provider_factory(selected), selected, rules, directory)
+        for task in tasks:
+            for group in groups:
+                parent = directory / group if len(groups) > 1 else directory
+                reports.append(json.loads((parent / task["id"] / "report.json").read_text()))
+    return write_summary(reports, settings, output, {
+        "mode": "language_matrix", "language": None, "languages": list(task_matrix),
+        "task_count": len({t["id"] for tasks in task_matrix.values() for t in tasks}),
+        "task_language_runs": sum(len(tasks) for tasks in task_matrix.values()),
+        "groups": groups, "by_language": by_language,
+    })

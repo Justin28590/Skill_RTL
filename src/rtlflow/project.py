@@ -133,9 +133,9 @@ def expanded_policy(code):
     return {"status": "passed", "reason": "preprocessed_candidate_policy"}
 
 
-def scope_ports(binary, *, parameters=False):
-    """Icarus elaborated root ports, including parameter-specialized widths."""
-    scopes, ports, params, current = {}, {}, {}, None
+def scope_ports(binary, *, parameters=False, parameter_values=False, include_signed=False):
+    """Icarus elaborated ports and optional public parameter values."""
+    scopes, ports, params, values, current = {}, {}, {}, {}, None
     for line in Path(binary).read_text().splitlines():
         m = re.match(r'(S_\w+) \.scope (\w+), "([^"]+)" "([^"]+)" (.*);', line)
         if m:
@@ -145,15 +145,26 @@ def scope_ports(binary, *, parameters=False):
             current = ident
             ports[ident] = {}
             params[ident] = []
+            values[ident] = {}
         param = re.match(r'P_\w+ \.param/\w+ "([^"]+)" 0 ', line)
         if param and current:
             params[current].append(param[1])
+            value = re.search(r'C4<([01]+)>', line)
+            if value:
+                values[current][param[1]] = int(value[1], 2)
         p = re.match(r'\s*\.port_info \d+ /(INPUT|OUTPUT|INOUT) (\d+) "([^"]+)";', line)
         if p and current:
             ports[current][p[3]] = {"direction": p[1].lower(), "width": int(p[2])}
+            if include_signed:
+                ports[current][p[3]]["signed"] = False
+        net = re.match(r'v\w+ \.(?:net|var)(/(?:2)?s)?(?:/2u)? "([^"]+)"', line)
+        if include_signed and net and current and net[2] in ports[current]:
+            ports[current][net[2]]["signed"] = bool(net[1])
     def path(ident):
         name, parent, _, _ = scopes[ident]
         return (path(parent) + "." if parent else "") + name
+    if parameter_values:
+        return {path(i): values[i] for i, s in scopes.items() if s[2] == "module"}
     if parameters:
         return {path(i): sorted(params[i]) for i, s in scopes.items() if s[2] == "module"}
     return {path(i): {"module": s[3], "ports": ports[i]} for i, s in scopes.items() if s[2] == "module"}
@@ -215,6 +226,17 @@ def load_projects(path, selected=None, language="verilog"):
 
 
 def verify_project(files, directory, task, workdir, settings):
+    if task.get("design_contract") and not task.get("verification_bound"):
+        from .design_verify import bind_verification
+        try:
+            bound = bind_verification(task, workdir)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"functional_status": "not_run", "checks": {"frozen_artifacts": {
+                "status": "not_run", "reason": str(exc)}}, "reference_rtl_linked": False}
+        result = verify_project(files, directory, bound, workdir, settings)
+        result.update(contract_sha256=task["contract_sha256"], verification_sha256=task["verification_sha256"],
+                      validation_scope="frozen_independent_model_testbench")
+        return result
     directory, workdir = Path(directory).resolve(), Path(workdir).resolve()
     root = Path(task["dataset_root"])
     workdir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +309,13 @@ def verify_project(files, directory, task, workdir, settings):
             checks["interface"] = {"status": "failed", "reason": "missing_public_parameters",
                                    "top": top, "missing": sorted(set(names) - set(actual_parameters.get(top, [])))}
             return finish()
+    if task.get("design_contract"):
+        actual_values = scope_ports(workdir / "candidate-only.vvp", parameter_values=True)
+        for top in task["design_contract"]["contract"]["tops"]:
+            if (actual_values.get(top["name"]) != top["parameters"]
+                    or set(actual_parameters.get(top["name"], [])) != set(top["parameters"])):
+                checks["interface"] = {"status": "failed", "reason": "frozen_parameter_defaults_mismatch"}
+                return finish()
     testbench = [root / name for name in task["candidate_testbench_files"]]
     binary = workdir / "simulation.vvp"
     # The TB uses its original dialect (notably SPI's `int` identifier). Candidate SV was
@@ -311,7 +340,7 @@ def verify_project(files, directory, task, workdir, settings):
     if re.search(r'warning:.*(?:parameter .*not found|defparam.*not found)', compile_log, re.I):
         checks["interface"] = {"status": "failed", "reason": "public_parameter_override_not_applied"}
         return finish()
-    actual = scope_ports(binary)
+    actual = scope_ports(binary, include_signed=bool(task.get("design_contract")))
     interface_ok = all(actual.get(name) == expected for name, expected in task["expected_ports"].items())
     checks["interface"] = {"status": "passed" if interface_ok else "failed", "reason": "public_ports_exact",
                            "actual": {name: actual.get(name) for name in task["dut_roots"]}}

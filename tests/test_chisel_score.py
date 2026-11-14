@@ -5,9 +5,9 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from helpers import RULES, SequenceProvider, TemporaryTestCase
+from helpers import RULES, SequenceProvider, TemporaryTestCase, ImplementationTestCase
 from rtlflow.chisel_score import CHISEL_SCORE_VERSION, _mask_scala
-from rtlflow.pipeline import run_group_comparison, run_task
+from rtlflow.pipeline import run_group_comparison, _run_implementation as run_task
 from rtlflow.project import bundle_text, parse_bundle, write_bundle
 from rtlflow.score import score_readability
 
@@ -132,7 +132,7 @@ val first = 0; val second = 1
             score_readability(SOURCE, 'scala')
 
 
-class ChiselScorePipelineTests(TemporaryTestCase):
+class ChiselScorePipelineTests(ImplementationTestCase):
     def verifier(self, statuses):
         calls = []
         def verify(files, source, task, checks, settings):

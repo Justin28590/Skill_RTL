@@ -115,3 +115,18 @@ class TemporaryTestCase(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
+
+
+class ImplementationTestCase(TemporaryTestCase):
+    """Unit-test the implementation/transport layer, not requirements orchestration.
+
+    These historical tiny fixtures already have a TB. The public workflow is
+    exercised separately by test_design_flow; this seam is test-only.
+    """
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        from rtlflow.pipeline import _run_implementation
+        controller = patch('rtlflow.pipeline.run_task', _run_implementation)
+        controller.start()
+        self.addCleanup(controller.stop)

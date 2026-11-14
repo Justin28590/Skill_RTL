@@ -5,6 +5,8 @@ Chisel build/integration coverage lives in test_chisel.py (explicit opt-in).
 
 from pathlib import Path
 import re
+import shutil
+import tempfile
 import unittest
 
 from helpers import HAS_ICARUS, ROOT, TemporaryTestCase
@@ -36,6 +38,30 @@ class SkillDocumentTests(unittest.TestCase):
                     continue
                 with self.subTest(document=path.name, target=target):
                     self.assertTrue((path.parent / target.split("#", 1)[0]).exists())
+
+    def test_skill_directory_is_portable_without_repository_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            installed = Path(temporary) / 'rtl-readable'
+            shutil.copytree(SKILL, installed)
+            self.assertTrue((installed / 'README.md').is_file())
+            for document in installed.rglob('*.md'):
+                for target in re.findall(r'\[[^\]]+\]\(([^)]+)\)', document.read_text()):
+                    if '://' in target or target.startswith('#'):
+                        continue
+                    resolved = (document.parent / target.split('#', 1)[0]).resolve()
+                    with self.subTest(document=document.name, target=target):
+                        self.assertTrue(resolved.is_relative_to(installed.resolve()))
+                        self.assertTrue(resolved.exists())
+
+    def test_runtime_guidance_does_not_embed_evaluator_protocol(self):
+        documents = [SKILL / 'SKILL.md', SKILL / 'rules.md', *sorted((SKILL / 'references').glob('*.md'))]
+        for document in documents:
+            content = document.read_text()
+            for evaluator_detail in ('read_skill', 'Baseline', 'max_agent_turns', 'RTLFlowMain',
+                                     'static-heuristic-v1', 'static-sv-heuristic-v1', 'static-chisel-heuristic-v1',
+                                     'configs/glm.json', 'run.py', 'schema_version', '128文件', '2 MB'):
+                with self.subTest(document=document.name, detail=evaluator_detail):
+                    self.assertNotIn(evaluator_detail, content)
 
     def test_language_guidance_is_routed_to_references(self):
         text = (SKILL / "SKILL.md").read_text()

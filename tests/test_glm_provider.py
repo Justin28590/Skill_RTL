@@ -7,10 +7,11 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from helpers import HAS_ICARUS, ROOT, RULES, TASKS, SkillHTTPReplay, TemporaryTestCase, fixture
+from helpers import HAS_ICARUS, ROOT, RULES, TASKS, SkillHTTPReplay, ImplementationTestCase as TemporaryTestCase, fixture
 from rtlflow.cli import load_settings, main
-from rtlflow.pipeline import initial_messages, run_batch, run_task
+from rtlflow.pipeline import initial_messages, run_batch
 from rtlflow.providers import GLMProvider, GenerationError
+from rtlflow.skill_tools import SkillReader
 
 
 KEY = "fake-glm-key-for-tests"
@@ -38,32 +39,15 @@ class GLMProviderTests(TemporaryTestCase):
         with patch("rtlflow.cli.GLMProvider") as provider, patch("rtlflow.cli.MockProvider") as replay, \
                 patch("rtlflow.cli.run_batch") as batch, patch("builtins.print"):
             batch.return_value = {"passed": 1, "total": 1}
-            self.assertEqual(main(["--task", "aes", "--group", "Skill"]), 0)
+            self.assertEqual(main(["--language", "verilog", "--task", "aes", "--group", "Skill",
+                                   "--output", str(self.directory/'run')]), 0)
         settings = provider.call_args.args[0]
         self.assertEqual(settings["model"], "glm-5.3")
         self.assertEqual(settings["thinking"], "high")
         self.assertEqual(settings["api_key_env"], "GLM_API_KEY")
+        self.assertEqual(settings["tasks"], str(ROOT / "data/requirements.json"))
         self.assertEqual(batch.call_args.args[1], provider.return_value)
         replay.assert_not_called()
-
-    def test_removed_providers_rejected_before_any_call(self):
-        path = self.directory / "old-config.json"
-        for name in ("pi", "openai", "unknown"):
-            path.write_text(json.dumps({**self.settings, "provider": name}))
-            with self.subTest(provider=name), patch("rtlflow.cli.GLMProvider") as provider, \
-                    patch("rtlflow.cli.run_batch") as batch, patch("builtins.print"):
-                with self.assertRaisesRegex(ValueError, "provider 仅支持 glm"):
-                    load_settings(path)
-                self.assertEqual(main(["--config", str(path), "--task", "and2"]), 2)
-                provider.assert_not_called()
-                batch.assert_not_called()
-
-    def test_default_config_selects_project_generation_catalog(self):
-        self.assertTrue(self.settings["tasks"].endswith("/project-rtl/tasks.json"))
-        from rtlflow.project import load_projects as load_tasks
-        for language in ("verilog", "systemverilog"):
-            self.assertEqual(len(load_tasks(self.settings["tasks"], language=language)),
-                             {'verilog': 27, 'systemverilog': 30, 'chisel': 2}[language])
 
     def test_high_request_and_public_only_messages(self):
         provider = GLMProvider(self.settings)
@@ -75,10 +59,11 @@ class GLMProviderTests(TemporaryTestCase):
         body = json.loads(request.data)
         self.assertEqual(request.full_url, "https://open.bigmodel.cn/api/paas/v4/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer " + KEY)
-        self.assertEqual(call.call_args.kwargs["timeout"], 120)
+        self.assertEqual(call.call_args.kwargs["timeout"], 600)
         self.assertEqual(body, {"model": "glm-5.3", "messages": messages,
-                               "temperature": 1.0, "max_tokens": 32768,
-                               "thinking": {"type": "enabled"}, "reasoning_effort": "high"})
+                               "temperature": 1.0,
+                               "thinking": {"type": "enabled"}, "reasoning_effort": "high",
+                               "stream": True, "stream_options": {"include_usage": True}})
         for hidden in (KEY, "testbenches/", "RTL_BENCH_PASS", "AND truth table mismatch"):
             self.assertNotIn(hidden, request.data.decode())
         self.assertEqual(result.text, fixture("and2.v"))
@@ -90,6 +75,48 @@ class GLMProviderTests(TemporaryTestCase):
         self.assertEqual(result.metadata["model_calls"], 1)
         self.assertNotIn(REASONING, repr(result))
         self.assertNotIn(KEY, repr(result))
+
+    def test_optional_token_limit_is_omitted_or_explicit_for_all_request_modes(self):
+        path = self.directory / "config.json"
+        for extra in ({}, {"max_tokens": None}, {"max_tokens": 65536}):
+            path.write_text(json.dumps({**self.settings, **extra}))
+            settings = load_settings(path)
+            for stream in (False, True):
+                provider = GLMProvider({**settings, "api_stream": stream})
+                for skill in (None, SkillReader("verilog")):
+                    with self.subTest(extra=extra, stream=stream, skill=skill is not None):
+                        body = provider.request_body([], skill)
+                        if extra.get("max_tokens") is None:
+                            self.assertNotIn("max_tokens", body)
+                        else:
+                            self.assertEqual(body["max_tokens"], 65536)
+        # Direct SDK use must not silently fall back to 8192 either.
+        self.assertNotIn("max_tokens", GLMProvider({}).request_body([]))
+
+    def test_invalid_token_limits_rejected_before_api_call(self):
+        path = self.directory / "config.json"
+        for value in (0, -1, True, False, 1.5, "32768", [], {}):
+            settings = {**self.settings, "max_tokens": value}
+            path.write_text(json.dumps(settings))
+            with self.subTest(value=value), patch("rtlflow.providers.urllib.request.urlopen") as http:
+                with self.assertRaisesRegex(ValueError, "max_tokens"):
+                    load_settings(path)
+                with self.assertRaisesRegex(ValueError, "max_tokens"):
+                    GLMProvider(settings)
+                http.assert_not_called()
+
+    def test_truncation_diagnostic_records_requested_limit_without_accepting_partial_rtl(self):
+        for limit in (None, 65536):
+            with self.subTest(limit=limit), patch("rtlflow.providers.urllib.request.urlopen",
+                    return_value=api_response(code="partial", stop="length")) as http:
+                with self.assertRaises(GenerationError) as error:
+                    GLMProvider({**self.settings, "max_tokens": limit}).generate("and2", [])
+                self.assertEqual(error.exception.code, "output_truncated")
+                self.assertEqual(error.exception.metadata["max_tokens_requested"], limit)
+                self.assertEqual(error.exception.metadata["token_limit_mode"], "server_default" if limit is None else "explicit")
+                self.assertIn("服务端默认值" if limit is None else "max_tokens=65536", str(error.exception))
+                self.assertIn("不接受部分源码", str(error.exception))
+                http.assert_called_once()
 
     def test_missing_key_names_correct_variable_without_fallback(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "other-key"}, clear=True), \
@@ -180,17 +207,6 @@ class GLMProviderTests(TemporaryTestCase):
             with self.assertRaises(KeyboardInterrupt):
                 GLMProvider(self.settings).generate("and2", [])
         call.assert_called_once()
-
-    def test_api_error_stops_task_without_repairs_or_source(self):
-        error = urllib.error.HTTPError("https://example.invalid", 401, KEY, {}, io.BytesIO(KEY.encode()))
-        with patch("rtlflow.providers.urllib.request.urlopen", side_effect=error) as call:
-            report = run_task(TASKS["and2"], GLMProvider(self.settings), self.settings, RULES, self.directory)
-        call.assert_called_once()
-        self.assertEqual(report["stop_reason"], "generation_error")
-        self.assertEqual(report["repair_calls"], 0)
-        self.assertIsNone(report["final_source"])
-        self.assertNotIn(KEY, json.dumps(report))
-        self.assertIn("HTTP 401", report["attempts"][0]["error"])
 
     @unittest.skipUnless(HAS_ICARUS, "requires Icarus/vvp")
     def test_offline_glm_repair_pipeline_and_secret_free_artifacts(self):

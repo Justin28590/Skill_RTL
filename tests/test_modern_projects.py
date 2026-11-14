@@ -1,16 +1,10 @@
-"""Pinned modern IP intake, independent FP oracle and semantic fault regressions."""
-import hashlib
-import json
+"""Independent FP oracle and modern IP testbench semantic fault regressions."""
 import unittest
 
 from helpers import HAS_ICARUS, ROOT, TemporaryTestCase
 from rtlflow.project import expanded_policy, load_projects, verify_project, write_bundle
-from rtlflow.project_dataset import load_manifest
 from scripts.build_fma_vectors import build, fma
 from scripts.verify_project_replay import reference_bundle
-
-IDS = ('fp32_fma', 'axi_dma_engine', 'axi_scratchpad', 'axis_async_bridge')
-
 
 class ModernProjectTests(TemporaryTestCase):
     def task(self, key):
@@ -21,28 +15,6 @@ class ModernProjectTests(TemporaryTestCase):
         write_bundle(files, directory / 'source')
         return verify_project(files, directory / 'source', task, directory / 'checks',
                               {'language': 'verilog', 'tool_timeout_seconds': 30})
-
-    def test_modern_selection_provenance_and_old_tasks_preserved(self):
-        base = ROOT / 'data/project-rtl'
-        _, manifest, sources = load_manifest(base / 'tasks.json')
-        tasks = {t['id']: t for t in manifest['tasks']}
-        # Pin the same v3 reference semantics, independent of layout/spec consolidation.
-        # This digest was computed BEFORE migration; test/source contents are still hash-locked.
-        previous = [{k: v for k, v in t.items()
-                     if k not in {'generation', 'specification', 'specification_sha256'}}
-                    for t in tasks.values() if t['id'] not in IDS]
-        canonical = json.dumps(sorted(previous, key=lambda t: t['id']), sort_keys=True, separators=(',', ':'))
-        canonical = canonical.replace('tests/blackbox/', 'verification/')
-        self.assertEqual(len(previous), 28)
-        digest = hashlib.sha256(canonical.encode()).hexdigest()
-        self.assertEqual(digest, 'e6f32a4588d7e21d3a1539bc5d7d45048975b2aa5ca8ded0690b8f27df882d09')
-        self.assertEqual(set(tasks) - {t['id'] for t in previous}, set(IDS))
-        for language in ('verilog', 'systemverilog'):
-            self.assertEqual({t['id'] for t in load_projects(base / 'tasks.json', IDS, language)}, set(IDS))
-        self.assertEqual(sources['bsg-external/HardFloat']['license'], 'BSD-3-Clause')
-        self.assertIn('rtl/axis_switch.v', sources['alexforencich/verilog-axis']['files'])
-        self.assertIn('rtl/axis_async_fifo.v', sources['alexforencich/verilog-axis']['files'])
-        self.assertEqual(len({tasks[key]['category'] for key in IDS}), 4)
 
     def test_exact_fma_oracle_known_ieee_answers(self):
         for a,b,c,op,mode,result,flags in (

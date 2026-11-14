@@ -44,7 +44,7 @@ target/
 /data/project-rtl/sources/
 
 # Optional validation output stays local; no files in this directory are tracked.
-# Rebuild on demand; opt in to hash checks with RTL_VALIDATE_EVIDENCE=1.
+# Rebuild current evidence on demand with the validation scripts.
 /artifacts/
 
 # Local assignment reference, not a runtime dependency

@@ -5,22 +5,22 @@ import json
 import unittest
 from unittest.mock import patch
 
-from helpers import HAS_ICARUS, RULES, TASKS, SequenceProvider, TemporaryTestCase, fixture
+from helpers import HAS_ICARUS, RULES, TASKS, SequenceProvider, ImplementationTestCase as TemporaryTestCase, fixture
 from rtlflow.cli import main, planned_calls
-from rtlflow.pipeline import GROUPS, run_group_comparison, run_task
+from rtlflow.pipeline import GROUPS, run_group_comparison, _run_implementation as run_task
 from rtlflow.providers import GenerationError
+from rtlflow.skill_tools import SKILL_RELOAD_REQUEST
 
 
 class ComparisonTests(TemporaryTestCase):
     def test_default_all_groups_and_explicit_subset(self):
-        for args, groups in (([], list(GROUPS)), (['--all-groups'], list(GROUPS)),
-                             (['--groups', 'Skill', 'Baseline'], ['Skill', 'Baseline']),
-                             (['--groups', 'Skill'], ['Skill'])):
+        for args, groups in (([], list(GROUPS)),
+                             (['--group', 'Skill', 'Baseline'], ['Skill', 'Baseline'])):
             with self.subTest(args=args), \
                     patch('rtlflow.cli.run_group_comparison', return_value={'passed': 1, 'total': 1}) as runner, \
                     patch('rtlflow.cli.create_provider'), contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(main(['--task', 'aes', *args]), 0)
+                self.assertEqual(main(['--language', 'verilog', '--task', 'aes', *args]), 0)
                 self.assertEqual(runner.call_args.args[4], groups)
 
     def test_single_group_and_offline_check_matrix(self):
@@ -28,16 +28,16 @@ class ComparisonTests(TemporaryTestCase):
             with patch('rtlflow.cli.create_provider'), \
                     patch('rtlflow.cli.run_batch', return_value={'passed': 1, 'total': 1}) as batch, \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(main(['--task', 'aes', '--group', group]), 0)
+                self.assertEqual(main(['--language', 'verilog', '--task', 'aes', '--group', group]), 0)
                 self.assertEqual(batch.call_args.args[2]['group'], group)
         with patch('rtlflow.cli.create_provider') as provider, contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(main(['--check-data', '--task', 'aes', '--task', 'cmac']), 0)
+            self.assertEqual(main(['--language', 'verilog', '--check-data', '--task', 'aes', '--task', 'cmac']), 0)
             result = json.loads(out.getvalue())
             self.assertEqual(result['total'], 2)
             self.assertEqual(result['groups'], list(GROUPS))
             self.assertEqual(result['task_group_runs'], 4)
-            self.assertEqual(result['max_provider_calls'], 16)
-            self.assertEqual(result['max_model_calls'], 56)
+            self.assertEqual(result['max_provider_calls'], 48)
+            self.assertEqual(result['max_model_calls'], 168)
             self.assertEqual(result['model_calls'], 0)
             provider.assert_not_called()
 
@@ -47,7 +47,7 @@ class ComparisonTests(TemporaryTestCase):
                 main(args)
             self.assertEqual(raised.exception.code, 2)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            main(['--groups', 'Baseline', 'Baseline'])
+            main(['--group', 'Baseline', 'Baseline'])
 
     def test_invalid_groups_empty_tasks_and_existing_output_rejected(self):
         for groups, tasks in (([], [TASKS['and2']]), (['Baseline', 'Baseline'], [TASKS['and2']]),
@@ -84,9 +84,12 @@ class ComparisonTests(TemporaryTestCase):
         self.assertEqual([{k: v for k, v in c.items() if k != 'group'} for c in configs], [settings, settings])
         self.assertEqual([s is not None for s in providers[0].skills], [False]*3)
         self.assertEqual([s is not None for s in providers[1].skills], [True]*3)
-        # Previous candidate and feedback must be identical for identical outcomes.
+        # Previous candidate and diagnostic feedback stay identical; only Skill's
+        # fresh-session loading instruction differs, not the repair task or budget.
         for index in (1, 2):
-            self.assertEqual(providers[0].messages[index][2:], providers[1].messages[index][2:])
+            baseline, skill = providers[0].messages[index], providers[1].messages[index]
+            self.assertEqual(baseline[2], skill[2])
+            self.assertEqual(skill[3], {'role': 'user', 'content': SKILL_RELOAD_REQUEST + baseline[3]['content']})
         rows = summary['by_task']['and2']
         for group in GROUPS:
             row = rows[group]
@@ -109,7 +112,7 @@ class ComparisonTests(TemporaryTestCase):
             settings = {'provider': 'glm', 'max_repairs': repairs, 'max_refactors': refactors, 'max_agent_turns': 6}
             attempts = 1 + repairs + refactors
             self.assertEqual(planned_calls(settings, GROUPS, 2),
-                             {'max_provider_calls': 4*attempts, 'max_model_calls': 14*attempts})
+                             {'max_provider_calls': 4*(attempts+8), 'max_model_calls': 14*(attempts+8)})
             for group in GROUPS:
                 summary = run_group_comparison([TASKS['and2']], lambda _: SequenceProvider(['not JSON']),
                                               settings, RULES, [group], self.directory/f'{group}-{repairs}')
